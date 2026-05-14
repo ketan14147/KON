@@ -50,7 +50,7 @@ APPROVE_USER, APPROVE_DAYS = 1, 2
 DISAPPROVE_USER = 3
 SETAPI_URL, SETAPI_KEY = 4, 5
 
-# ============ ATTACK ENGINE SETTINGS ============
+# ============ ATTACK ENGINE SETTINGS (Global Variables) ===========_
 ATTACK_THREADS = 150
 SOCKETS_PER_THREAD = 20
 ATTACK_DELAY = 0.00001
@@ -426,6 +426,15 @@ def attack_flood_kb():
 def attack_back_kb():
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_main")]])
 
+# ============ Function to update attack threads ============
+def set_attack_threads(value):
+    global ATTACK_THREADS
+    ATTACK_THREADS = value
+
+def get_attack_threads():
+    global ATTACK_THREADS
+    return ATTACK_THREADS
+
 # ============ HANDLERS ============
 async def start_cmd(update, context):
     uid = update.effective_user.id
@@ -514,7 +523,7 @@ async def button_handler(update, context):
         url_disp = url if url else "Not set"
         key_disp = (key[:10]+"...") if key else "Not set"
         await query.edit_message_text(
-            f"👑 *Admin Panel*\n🔗 API URL: `{url_disp}`\n🔑 API Key: `{key_disp}`\n⚙️ Threads: `{ATTACK_THREADS}`",
+            f"👑 *Admin Panel*\n🔗 API URL: `{url_disp}`\n🔑 API Key: `{key_disp}`\n⚙️ Threads: `{get_attack_threads()}`",
             parse_mode="Markdown", reply_markup=admin_panel_kb()
         )
     elif data == "back_main":
@@ -534,7 +543,7 @@ async def button_handler(update, context):
         if not is_admin: return
         users = db.get_all_users()
         total_atk = sum(u.get('total_attacks',0) for u in users)
-        txt = f"📊 *Bot Stats*\n👥 Users: {len(users)}\n🎯 Total attacks: {total_atk}\n🚫 Blocked ports: {len(BLOCKED_PORTS)}\n⚙️ Threads: {ATTACK_THREADS}"
+        txt = f"📊 *Bot Stats*\n👥 Users: {len(users)}\n🎯 Total attacks: {total_atk}\n🚫 Blocked ports: {len(BLOCKED_PORTS)}\n⚙️ Threads: {get_attack_threads()}"
         await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=admin_panel_kb())
     elif data == "admin_status":
         if not is_admin: return
@@ -560,19 +569,19 @@ async def button_handler(update, context):
             [InlineKeyboardButton("⬇️ -10 Threads", callback_data="dec_threads")],
             [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
         ]
-        await query.edit_message_text(f"⚙️ *Settings*\nThreads: `{ATTACK_THREADS}`\nSockets/Thread: `{SOCKETS_PER_THREAD}`\nDelay: `{ATTACK_DELAY}`s", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+        await query.edit_message_text(f"⚙️ *Settings*\nThreads: `{get_attack_threads()}`\nSockets/Thread: `{SOCKETS_PER_THREAD}`\nDelay: `{ATTACK_DELAY}`s", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
     elif data == "inc_threads":
-        nonlocal ATTACK_THREADS
-        if ATTACK_THREADS + 10 <= 200:
-            ATTACK_THREADS += 10
-            await query.edit_message_text(f"✅ Threads: {ATTACK_THREADS}", reply_markup=admin_panel_kb())
+        current = get_attack_threads()
+        if current + 10 <= 200:
+            set_attack_threads(current + 10)
+            await query.edit_message_text(f"✅ Threads increased to {get_attack_threads()}", reply_markup=admin_panel_kb())
         else:
             await query.answer("Max 200 threads!", show_alert=True)
     elif data == "dec_threads":
-        nonlocal ATTACK_THREADS
-        if ATTACK_THREADS - 10 >= 50:
-            ATTACK_THREADS -= 10
-            await query.edit_message_text(f"✅ Threads: {ATTACK_THREADS}", reply_markup=admin_panel_kb())
+        current = get_attack_threads()
+        if current - 10 >= 50:
+            set_attack_threads(current - 10)
+            await query.edit_message_text(f"✅ Threads decreased to {get_attack_threads()}", reply_markup=admin_panel_kb())
         else:
             await query.answer("Min 50 threads!", show_alert=True)
     elif data in ["stop_attack", "info_attack", "refresh_attack"]:
@@ -798,7 +807,7 @@ def main():
     print("=" * 60)
     print("🤖 Starting DDoS Bot...")
     print(f"👑 Admins: {ADMIN_IDS}")
-    print(f"⚙️ Attack Threads: {ATTACK_THREADS}")
+    print(f"⚙️ Attack Threads: {get_attack_threads()}")
     print(f"🔌 Sockets per thread: {SOCKETS_PER_THREAD}")
     print("=" * 60)
     
