@@ -690,4 +690,4 @@ async def myinfo_cmd(update, context):
     if u.get("approved"):
         exp = u.get("expires_at")
         days = max(0, (make_aware(exp) - get_current_time()).days) if exp else 0
-        await update.message.reply_text(f"✅ Approved\nUser: {uid}\nExpires: {days} days\nAttacks
+        txt = f"✅ Approved\nUser: {uid}\nExpires: {days} days\nAttacks: {u.get
